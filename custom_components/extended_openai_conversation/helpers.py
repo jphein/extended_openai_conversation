@@ -62,7 +62,9 @@ def get_exposed_entities(hass: HomeAssistant) -> list[dict[str, Any]]:
 
         aliases: list[str] = []
         if entity and entity.aliases:
-            aliases = [str(a) for a in entity.aliases]
+            # HA 2026.7.x puts a ComputedNameType sentinel in this set; str() on it
+            # yields the literal "ComputedNameType._singleton". Keep real aliases only.
+            aliases = [a for a in entity.aliases if isinstance(a, str)]
 
         exposed_entities.append(
             {
