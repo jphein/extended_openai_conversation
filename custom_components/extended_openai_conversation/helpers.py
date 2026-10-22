@@ -13,10 +13,14 @@ from homeassistant.components import conversation
 from homeassistant.components.homeassistant.exposed_entities import async_should_expose
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.httpx_client import get_async_client
+from homeassistant.helpers.httpx_client import (
+    create_async_httpx_client,
+    get_async_client,
+)
 from homeassistant.helpers.template import Template
 
 from .const import (
+    DEFAULT_FOLLOW_REDIRECTS,
     DEFAULT_MODEL_CONFIG,
     DEFAULT_TOKEN_PARAM,
     MODEL_CONFIG_PATTERNS,
@@ -98,13 +102,15 @@ def convert_to_template(
 ) -> None:
     if template_keys is None:
         template_keys = ["data", "event_data", "target", "service"]
+    if hass is None:
+        raise ValueError("hass is required to convert settings to templates")
     _convert_to_template(settings, template_keys, hass, [])
 
 
 def _convert_to_template(
     settings: Any,
     template_keys: list[str],
-    hass: HomeAssistant | None,
+    hass: HomeAssistant,
     parents: list[str],
 ) -> None:
     if isinstance(settings, dict):
@@ -135,8 +141,15 @@ async def get_authenticated_client(
     organization: str | None,
     api_provider: str | None,
     skip_authentication: bool = False,
+    follow_redirects: bool = DEFAULT_FOLLOW_REDIRECTS,
 ) -> AsyncClient:
     """Validate OpenAI authentication."""
+
+    http_client = (
+        create_async_httpx_client(hass, follow_redirects=True)
+        if follow_redirects
+        else get_async_client(hass)
+    )
 
     client: AsyncClient
     if base_url and (is_azure_url(base_url) or api_provider == "azure"):
@@ -145,14 +158,14 @@ async def get_authenticated_client(
             azure_endpoint=base_url,
             api_version=api_version,
             organization=organization,
-            http_client=get_async_client(hass),
+            http_client=http_client,
         )
     else:
         client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
             organization=organization,
-            http_client=get_async_client(hass),
+            http_client=http_client,
         )
 
     if skip_authentication:
