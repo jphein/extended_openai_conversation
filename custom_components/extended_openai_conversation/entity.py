@@ -20,7 +20,8 @@ from voluptuous_openapi import convert
 
 from homeassistant.components import conversation
 from homeassistant.config_entries import ConfigSubentry
-from homeassistant.helpers import device_registry as dr, llm
+from homeassistant.exceptions import TemplateError
+from homeassistant.helpers import device_registry as dr, llm, template
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import slugify
 
@@ -28,6 +29,7 @@ from .const import (
     CONF_CHAT_MODEL,
     CONF_CONTEXT_THRESHOLD,
     CONF_CONTEXT_TRUNCATE_STRATEGY,
+    CONF_EXTRA_BODY,
     CONF_MAX_FUNCTION_CALLS_PER_CONVERSATION,
     CONF_MAX_TOKENS,
     CONF_REASONING_EFFORT,
@@ -38,6 +40,7 @@ from .const import (
     DEFAULT_CHAT_MODEL,
     DEFAULT_CONTEXT_THRESHOLD,
     DEFAULT_CONTEXT_TRUNCATE_STRATEGY,
+    DEFAULT_EXTRA_BODY,
     DEFAULT_MAX_FUNCTION_CALLS_PER_CONVERSATION,
     DEFAULT_MAX_TOKENS,
     DEFAULT_REASONING_EFFORT,
@@ -58,6 +61,43 @@ _LOGGER = logging.getLogger(__name__)
 
 # Max number of back and forth with the LLM to generate a response
 MAX_TOOL_ITERATIONS = 20
+
+
+def _tool_result_data(content: conversation.ToolResultContent) -> Any:
+    """Return the data of a tool result across Home Assistant versions.
+
+    Home Assistant 2026.10 replaced ``ToolResultContent.tool_result`` with
+    ``ToolResultContent.result`` (an ``llm.ToolResult``) and deprecated the old
+    attribute.
+    """
+    result = getattr(content, "result", None)
+    if result is not None:
+        return result.data
+    return content.tool_result
+
+
+def _make_tool_result_content(
+    agent_id: str, tool_call_id: str, tool_name: str, data: dict[str, Any]
+) -> conversation.ToolResultContent:
+    """Build a ToolResultContent across Home Assistant versions.
+
+    Home Assistant 2026.10 requires ``result=llm.ToolResult(...)`` and no longer
+    accepts the ``tool_result`` keyword.
+    """
+    if hasattr(llm, "ToolResult"):
+        return conversation.ToolResultContent(
+            agent_id=agent_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            result=llm.ToolResult(data=data),
+        )
+    # Home Assistant before 2026.10
+    return conversation.ToolResultContent(  # type: ignore[call-arg]
+        agent_id=agent_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        tool_result=data,
+    )
 
 
 def _shorten_tool_call_id(tool_call_id: str) -> str:
@@ -150,7 +190,7 @@ def _convert_content_to_param(
                     "tool_call_id": _shorten_tool_call_id(content.tool_call_id)
                     if shorten_tool_call_id
                     else content.tool_call_id,
-                    "content": orjson.dumps(content.tool_result).decode(),
+                    "content": orjson.dumps(_tool_result_data(content)).decode(),
                 }
             )
 
@@ -253,6 +293,23 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             api_kwargs["service_tier"] = options.get(
                 CONF_SERVICE_TIER, DEFAULT_SERVICE_TIER
             )
+
+        # Add extra_body if configured — passthrough for OpenAI-compatible
+        # backends that accept extra request-body fields (ollama, llama.cpp,
+        # vLLM, LM Studio, etc.). E.g. {"chat_template_kwargs":
+        # {"enable_thinking": false}} to disable Qwen3 reasoning, or
+        # {"cache_prompt": true} for llama.cpp prompt caching. Value is a
+        # Jinja-templatable JSON string; empty string disables.
+        extra_body_raw = options.get(CONF_EXTRA_BODY, DEFAULT_EXTRA_BODY) or ""
+        if extra_body_raw.strip():
+            try:
+                rendered = template.Template(extra_body_raw, self.hass).async_render(
+                    parse_result=False
+                )
+                if rendered.strip():
+                    api_kwargs["extra_body"] = json.loads(rendered)
+            except (TemplateError, json.JSONDecodeError) as err:
+                _LOGGER.warning("Invalid extra_body for %s, ignoring: %s", model, err)
 
         # Add structured output format if provided
         if structure is not None:
@@ -465,11 +522,11 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                 self.hass, function_config, arguments, llm_context, exposed_entities
             )
 
-        return conversation.ToolResultContent(
+        return _make_tool_result_content(
             agent_id=self.entity_id,
             tool_call_id=tool_input.id,
             tool_name=tool_input.tool_name,
-            tool_result={"result": str(result)},
+            data={"result": str(result)},
         )
 
     def should_run_in_background(self, arguments: dict[str, Any]) -> bool:
